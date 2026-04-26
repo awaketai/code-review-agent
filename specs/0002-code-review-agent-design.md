@@ -144,7 +144,7 @@ src/
 
 ```typescript
 import type { Tool } from "simple-agent"
-import { readFile } from "node:fs/promises"
+import { readFile, realpath } from "node:fs/promises"
 import { resolve } from "node:path"
 
 export function createReadFileTool(workDir: string): Tool {
@@ -164,14 +164,18 @@ export function createReadFileTool(workDir: string): Tool {
     execute: async (args) => {
       const { path } = args as { path: string }
       const absolute = resolve(workDir, path)
+      const resolvedWorkDir = await realpath(workDir)
 
-      // 安全检查：禁止路径穿越到工作目录之外
       if (!absolute.startsWith(resolve(workDir))) {
         return { output: "", error: `Path traversal denied: ${path}` }
       }
 
       try {
-        const content = await readFile(absolute, "utf-8")
+        const real = await realpath(absolute)
+        if (!real.startsWith(resolvedWorkDir)) {
+          return { output: "", error: `Path traversal denied: ${path}` }
+        }
+        const content = await readFile(real, "utf-8")
         return { output: content }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
@@ -184,6 +188,7 @@ export function createReadFileTool(workDir: string): Tool {
 
 **关键决策：**
 - 路径相对于工作目录解析，防止路径穿越
+- 使用 `realpath` 解析符号链接后二次检查，防止 symlink 绕过
 - 返回完整文件内容，由 LLM 自行定位关注区域
 - 对于不存在的文件返回 error，让 LLM 感知失败并调整策略
 
@@ -191,7 +196,7 @@ export function createReadFileTool(workDir: string): Tool {
 
 ```typescript
 import type { Tool } from "simple-agent"
-import { writeFile, mkdir } from "node:fs/promises"
+import { writeFile, mkdir, realpath } from "node:fs/promises"
 import { resolve, dirname } from "node:path"
 
 export function createWriteFileTool(workDir: string): Tool {
@@ -216,6 +221,7 @@ export function createWriteFileTool(workDir: string): Tool {
     execute: async (args) => {
       const { path, content } = args as { path: string; content: string }
       const absolute = resolve(workDir, path)
+      const resolvedWorkDir = await realpath(workDir)
 
       if (!absolute.startsWith(resolve(workDir))) {
         return { output: "", error: `Path traversal denied: ${path}` }
@@ -223,6 +229,10 @@ export function createWriteFileTool(workDir: string): Tool {
 
       try {
         await mkdir(dirname(absolute), { recursive: true })
+        const realParent = await realpath(dirname(absolute))
+        if (!realParent.startsWith(resolvedWorkDir)) {
+          return { output: "", error: `Path traversal denied: ${path}` }
+        }
         await writeFile(absolute, content, "utf-8")
         return { output: `Written to ${path}` }
       } catch (err) {
@@ -236,6 +246,7 @@ export function createWriteFileTool(workDir: string): Tool {
 
 **关键决策：**
 - 自动创建父目录（`recursive: true`），避免 LLM 需要额外操作
+- 写入前用 `realpath` 检查父目录的真实路径，防止通过 symlinked 目录写入外部
 - System prompt 中已约束 LLM 不得用此工具修改源代码，代码层不做硬性限制（灵活性 > 过度防御）
 
 ### 4.3 `git`
@@ -279,7 +290,7 @@ export function createGitTool(workDir: string): Tool {
           maxBuffer: 10 * 1024 * 1024, // 10MB — 大 diff 场景
           timeout: 30_000
         })
-        const output = stdout || stderr
+        const output = stdout !== "" ? stdout : stderr
         return { output: output.trimEnd() }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
@@ -330,8 +341,24 @@ function parseCommand(command: string): string[] {
 import type { Tool } from "simple-agent"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
+import { parseCommand } from "./parse-command.ts"
 
 const execFileAsync = promisify(execFile)
+
+const ALLOWED_TOP_LEVEL = ["pr", "issue", "api", "repo"]
+const ALLOWED_PR_SUB = ["view", "diff", "checks", "list", "status"]
+const ALLOWED_ISSUE_SUB = ["view", "list", "status"]
+
+function hasWriteMethod(parts: string[]): boolean {
+  for (let i = 0; i < parts.length; i++) {
+    const arg = parts[i]
+    if (arg === "-X" || arg === "--method") {
+      const method = parts[i + 1]?.toUpperCase()
+      if (method && method !== "GET") return true
+    }
+  }
+  return false
+}
 
 export function createGhTool(workDir: string): Tool {
   return {
@@ -353,18 +380,27 @@ export function createGhTool(workDir: string): Tool {
       const { command } = args as { command: string }
       const parts = parseCommand(command)
 
-      // 安全检查：仅允许只读操作
-      const allowedTopLevel = ["pr", "issue", "api", "repo"]
-      if (!allowedTopLevel.includes(parts[0] ?? "")) {
-        return { output: "", error: `Blocked: 'gh ${parts[0]}' is not allowed in review mode` }
+      const topLevel = parts[0] ?? ""
+      if (!ALLOWED_TOP_LEVEL.includes(topLevel)) {
+        return { output: "", error: `Blocked: 'gh ${topLevel}' is not allowed in review mode` }
       }
 
-      // 对 pr 子命令进一步限制
-      if (parts[0] === "pr") {
-        const allowedPrSub = ["view", "diff", "checks", "list", "status"]
-        if (!allowedPrSub.includes(parts[1] ?? "")) {
-          return { output: "", error: `Blocked: 'gh pr ${parts[1]}' is not allowed in review mode. Allowed: ${allowedPrSub.join(", ")}` }
+      if (topLevel === "pr") {
+        const prSub = parts[1] ?? ""
+        if (!ALLOWED_PR_SUB.includes(prSub)) {
+          return { output: "", error: `Blocked: 'gh pr ${prSub}' is not allowed in review mode. Allowed: ${ALLOWED_PR_SUB.join(", ")}` }
         }
+      }
+
+      if (topLevel === "issue") {
+        const issueSub = parts[1] ?? ""
+        if (!ALLOWED_ISSUE_SUB.includes(issueSub)) {
+          return { output: "", error: `Blocked: 'gh issue ${issueSub}' is not allowed in review mode. Allowed: ${ALLOWED_ISSUE_SUB.join(", ")}` }
+        }
+      }
+
+      if (topLevel === "api" && hasWriteMethod(parts)) {
+        return { output: "", error: "Blocked: 'gh api' with non-GET method is not allowed in review mode" }
       }
 
       try {
@@ -373,7 +409,7 @@ export function createGhTool(workDir: string): Tool {
           maxBuffer: 10 * 1024 * 1024,
           timeout: 30_000
         })
-        const output = stdout || stderr
+        const output = stdout !== "" ? stdout : stderr
         return { output: output.trimEnd() }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
@@ -387,9 +423,11 @@ export function createGhTool(workDir: string): Tool {
 **关键决策：**
 - 白名单机制：只允许 `pr`、`issue`、`api`、`repo` 顶级命令
 - 对 `pr` 子命令进一步限制为只读操作（`view`、`diff`、`checks`、`list`、`status`）
+- 对 `issue` 子命令同样限制为只读操作（`view`、`list`、`status`）
 - 不允许 `pr merge`、`pr close`、`pr edit`、`pr review`（会提交 review）等写操作
-- `gh api` 允许通过是因为 LLM 需要读取 PR comments 和 reviews 等 REST API 才能获取的数据（`gh api` 默认是 GET 请求）
-- `parseCommand` 函数与 `git` 工具共享（见 4.3 节），应提取为公共工具函数
+- `gh api` 检测 `-X`/`--method` 参数，拦截非 GET 请求（`POST`、`PUT`、`DELETE` 等）
+- `parseCommand` 函数与 `git` 工具共享，提取为 `src/tools/parse-command.ts` 公共模块
+- `stdout !== "" ? stdout : stderr` 正确处理空 stdout（如无变更时），不会误用 stderr 替代
 - System prompt 中已告知 LLM 这些工具是只读的，LLM 不会主动尝试写操作；代码层的白名单是防御性兜底
 
 ---
@@ -469,14 +507,29 @@ export async function runCodeReview(input: string, config: ReviewConfig) {
 import { readFile } from "node:fs/promises"
 import { resolve, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
+import { existsSync } from "node:fs"
 
-const __dirname = dirname(fileURLToPath(import.meta.url))
+function findProjectRoot(startDir: string): string {
+  let dir = startDir
+  while (dir !== dirname(dir)) {
+    if (existsSync(resolve(dir, "package.json"))) return dir
+    dir = dirname(dir)
+  }
+  return startDir
+}
+
+const currentDir = dirname(fileURLToPath(import.meta.url))
+const projectRoot = findProjectRoot(currentDir)
 
 export async function loadSystemPrompt(): Promise<string> {
-  const promptPath = resolve(__dirname, "../../specs/0001-system.md")
+  const promptPath = resolve(projectRoot, "specs/0001-system.md")
   return readFile(promptPath, "utf-8")
 }
 ```
+
+**关键决策：**
+- 通过向上查找 `package.json` 定位项目根目录，而非硬编码相对路径
+- 在 `src/prompt/system.ts`（开发模式）和 `dist/index.js`（打包后）两种路径下都能正确工作
 
 ---
 
@@ -486,10 +539,10 @@ export async function loadSystemPrompt(): Promise<string> {
 
 | 风险 | System Prompt 防御（第一层） | 代码防御（第二层） |
 |------|---------------------------|-------------------|
-| 路径穿越 | 未覆盖（LLM 不感知绝对路径） | `read_file` / `write_file` 校验解析后的绝对路径必须在 `workDir` 内 |
+| 路径穿越 | 告知 LLM "路径穿越会被拒绝" | `resolve()` 前缀检查 + `realpath()` 解析符号链接后二次检查 |
 | Shell 注入 | 未覆盖（LLM 不了解底层实现） | 使用 `execFile` 而非 `exec`，不经过 shell 解释 |
 | Git 写操作 | 告知 LLM "git 是只读的，写操作会被拦截" | `git` 工具黑名单拦截 `push`、`commit`、`reset` 等 |
-| GitHub 写操作 | 告知 LLM "gh 是只读的，写操作会被拦截" | `gh` 工具白名单仅允许只读子命令 |
+| GitHub 写操作 | 告知 LLM "gh 是只读的，写操作会被拦截" | `gh` 工具白名单：`pr`/`issue` 子命令白名单 + `api` 拦截非 GET 方法 |
 | 大输出 OOM | 未覆盖 | `maxBuffer` 限制 10MB，`timeout` 30 秒 |
 | LLM 修改源代码 | 明确禁止："Never use `write_file` on source files" | 不做代码层限制（保留写报告的灵活性） |
 | LLM 无限循环 | 未覆盖 | `maxSteps` 限制（默认 50） |

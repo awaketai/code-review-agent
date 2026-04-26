@@ -24,3 +24,7 @@ based on @specs/prompts/codex.txt and @specs/prompts/reviewer.txt ,think hard,we
 整个过程是由 LLM 驱动，agent 只是提供合适的 system prompt 和合适的 tools
 
 system prompt 定义 code review 流程相关的所有行为规范
+
+## 构建 code review agent
+
+根据 @specs/0002-code-review-agent-design.md 文档，实现 code review agent 代码，使用 ../simple-agent 作为 dependency，代码要完整实现 design spec，符合其要求
