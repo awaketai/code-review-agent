@@ -1,3 +1,4 @@
+import "dotenv/config"
 import { createSession, streamAgent } from "simple-agent"
 import { createReadFileTool } from "./tools/read-file.ts"
 import { createWriteFileTool } from "./tools/write-file.ts"
@@ -6,6 +7,69 @@ import { createGhTool } from "./tools/gh.ts"
 import { loadSystemPrompt } from "./prompt/system.ts"
 import { defaultConfig } from "./config.ts"
 import type { AppConfig } from "./config.ts"
+import type { Tool } from "simple-agent"
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
+
+const execFileAsync = promisify(execFile)
+
+const MAX_SAME_CALL = 2
+
+function withLoopDetection(tool: Tool): Tool {
+  const callCounts = new Map<string, number>()
+
+  const originalExecute = tool.execute
+  return {
+    ...tool,
+    execute: async (args) => {
+      const key = `${tool.name}:${JSON.stringify(args)}`
+      const count = (callCounts.get(key) ?? 0) + 1
+      callCounts.set(key, count)
+
+      if (count > MAX_SAME_CALL) {
+        return {
+          output: "",
+          error: `Loop detected: you have called ${tool.name} with the same arguments ${count} times. Stop repeating and produce your review output now based on the information you already have.`,
+        }
+      }
+      return originalExecute(args)
+    },
+  }
+}
+
+async function runQuiet(workDir: string, args: string[]): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync("git", args, {
+      cwd: workDir,
+      timeout: 10_000,
+    })
+    return stdout.trim()
+  } catch {
+    return ""
+  }
+}
+
+async function buildContext(workDir: string): Promise<string> {
+  const [branch, logShort, statusShort] = await Promise.all([
+    runQuiet(workDir, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    runQuiet(workDir, ["log", "--oneline", "-5"]),
+    runQuiet(workDir, ["status", "--short"]),
+  ])
+
+  const lines: string[] = [
+    "[Repository context — you do NOT need to call git to discover this information]",
+    `Current branch: ${branch || "unknown"}`,
+  ]
+  if (logShort) {
+    lines.push(`Recent commits:\n${logShort}`)
+  }
+  if (statusShort) {
+    lines.push(`Uncommitted changes:\n${statusShort}`)
+  } else {
+    lines.push("Uncommitted changes: none")
+  }
+  return lines.join("\n")
+}
 
 interface ReviewConfig extends AppConfig {
   workDir: string
@@ -14,13 +78,14 @@ interface ReviewConfig extends AppConfig {
 export async function runCodeReview(input: string, config: ReviewConfig) {
   const workDir = config.workDir
   const systemPrompt = await loadSystemPrompt()
+  const context = await buildContext(workDir)
 
   const tools = [
     createReadFileTool(workDir),
     createWriteFileTool(workDir),
     createGitTool(workDir),
     createGhTool(workDir),
-  ]
+  ].map(withLoopDetection)
 
   const agentConfig = {
     model: config.model,
@@ -36,7 +101,9 @@ export async function runCodeReview(input: string, config: ReviewConfig) {
   session.messages.push({
     id: `user-${Date.now()}`,
     role: "user",
-    content: [{ type: "text", text: input }],
+    content: [
+      { type: "text", text: `${context}\n\n---\n\n${input}` },
+    ],
     createdAt: new Date(),
   })
 

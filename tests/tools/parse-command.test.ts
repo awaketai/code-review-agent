@@ -29,4 +29,20 @@ describe("parseCommand", () => {
   it("handles quoted string with spaces", () => {
     expect(parseCommand("commit -m 'fix the bug'")).toEqual(["commit", "-m", "fix the bug"])
   })
+
+  it("strips shell redirect 2>&1", () => {
+    expect(parseCommand("log --oneline 2>&1")).toEqual(["log", "--oneline"])
+  })
+
+  it("strips shell redirect >", () => {
+    expect(parseCommand("diff > output.txt")).toEqual(["diff"])
+  })
+
+  it("strips shell pipe |", () => {
+    expect(parseCommand("log --oneline | head -5")).toEqual(["log", "--oneline", "head", "-5"])
+  })
+
+  it("strips 2>> redirect", () => {
+    expect(parseCommand("log 2>> err.log")).toEqual(["log"])
+  })
 })

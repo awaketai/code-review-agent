@@ -16,6 +16,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
     "simple-agent": "file:../simple-agent"
   },
   "devDependencies": {
