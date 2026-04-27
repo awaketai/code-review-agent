@@ -30,13 +30,12 @@ describe("git tool", () => {
   it("runs git log", async () => {
     const result = await tool.execute({ command: "log --oneline" })
     expect(result.output).toContain("init")
-    expect(result.error).toBeUndefined()
+    expect(result.output).not.toContain("[ERROR]")
   })
 
   it("runs git diff with no changes (empty stdout)", async () => {
     const result = await tool.execute({ command: "diff" })
     expect(result.output).toBe("")
-    expect(result.error).toBeUndefined()
   })
 
   it("runs git diff with changes", async () => {
@@ -47,23 +46,23 @@ describe("git tool", () => {
 
   it("blocks git push", async () => {
     const result = await tool.execute({ command: "push origin main" })
-    expect(result.error).toContain("Blocked")
-    expect(result.error).toContain("push")
+    expect(result.output).toContain("Blocked")
+    expect(result.output).toContain("push")
   })
 
   it("blocks git commit", async () => {
     const result = await tool.execute({ command: "commit -m 'test'" })
-    expect(result.error).toContain("Blocked")
+    expect(result.output).toContain("Blocked")
   })
 
   it("blocks git reset", async () => {
     const result = await tool.execute({ command: "reset --hard HEAD" })
-    expect(result.error).toContain("Blocked")
+    expect(result.output).toContain("Blocked")
   })
 
   it("blocks git checkout", async () => {
     const result = await tool.execute({ command: "checkout -b new-branch" })
-    expect(result.error).toContain("Blocked")
+    expect(result.output).toContain("Blocked")
   })
 
   it("allows git blame", async () => {
@@ -78,6 +77,64 @@ describe("git tool", () => {
 
   it("returns error for invalid command", async () => {
     const result = await tool.execute({ command: "log --invalid-flag-xyz" })
-    expect(result.error).toBeDefined()
+    expect(result.output).toContain("[ERROR]")
+  })
+
+  it("rejects shell pipe", async () => {
+    const result = await tool.execute({ command: "log --oneline | head -5" })
+    expect(result.output).toContain("Shell metacharacters")
+  })
+
+  it("rejects shell redirect", async () => {
+    const result = await tool.execute({ command: "diff > out.txt" })
+    expect(result.output).toContain("Shell metacharacters")
+  })
+
+  it("rejects unknown subcommand", async () => {
+    const result = await tool.execute({ command: "foo bar" })
+    expect(result.output).toContain("Blocked")
+    expect(result.output).toContain("foo")
+  })
+
+  it("blocks git add (mutating)", async () => {
+    const result = await tool.execute({ command: "add ." })
+    expect(result.output).toContain("Blocked")
+  })
+
+  it("blocks git apply (mutating)", async () => {
+    const result = await tool.execute({ command: "apply patch.diff" })
+    expect(result.output).toContain("Blocked")
+  })
+
+  it("blocks git cherry-pick (mutating)", async () => {
+    const result = await tool.execute({ command: "cherry-pick abc1234" })
+    expect(result.output).toContain("Blocked")
+  })
+
+  it("blocks git revert (mutating)", async () => {
+    const result = await tool.execute({ command: "revert HEAD" })
+    expect(result.output).toContain("Blocked")
+  })
+
+  it("blocks git fetch (network)", async () => {
+    const result = await tool.execute({ command: "fetch origin" })
+    expect(result.output).toContain("Blocked")
+  })
+
+  it("allows git status", async () => {
+    const result = await tool.execute({ command: "status --short" })
+    expect(result.output).not.toContain("[ERROR]")
+  })
+
+  it("allows git rev-parse", async () => {
+    const result = await tool.execute({ command: "rev-parse HEAD" })
+    expect(result.output).toBeTruthy()
+    expect(result.output).not.toContain("[ERROR]")
+  })
+
+  it("allows git grep", async () => {
+    const result = await tool.execute({ command: "grep initial" })
+    expect(result.output).toContain("initial")
+    expect(result.output).not.toContain("[ERROR]")
   })
 })

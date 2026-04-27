@@ -1,30 +1,45 @@
 import type { Tool } from "simple-agent"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
-import { parseCommand } from "./parse-command.ts"
+import { parseCommand, assertNoShellChars } from "./parse-command.ts"
 
 const execFileAsync = promisify(execFile)
 
-const BLOCKED_SUBCOMMANDS = [
-  "push",
-  "reset",
-  "rebase",
-  "merge",
-  "commit",
-  "checkout",
-  "switch",
-  "branch",
-  "tag",
-  "stash",
-  "clean",
-  "rm",
-]
+const ALLOWED_SUBCOMMANDS = new Set([
+  "blame",
+  "config",
+  "describe",
+  "diff",
+  "for-each-ref",
+  "grep",
+  "help",
+  "log",
+  "ls-files",
+  "ls-remote",
+  "ls-tree",
+  "merge-base",
+  "name-rev",
+  "range-diff",
+  "reflog",
+  "rev-list",
+  "rev-parse",
+  "shortlog",
+  "show",
+  "show-branch",
+  "show-ref",
+  "status",
+  "var",
+  "verify-commit",
+  "verify-tag",
+  "version",
+  "whatchanged",
+])
 
 export function createGitTool(workDir: string): Tool {
   return {
     name: "git",
     description:
-      "Run a git subcommand. Examples: 'diff', 'diff --cached', 'log --oneline -20', 'show abc1234', 'blame src/file.ts', 'diff main...HEAD'. Do not include the leading 'git'.",
+      "Run a read-only git subcommand. Only read-only commands are allowed (diff, log, show, blame, status, grep, etc.). Examples: 'diff', 'diff --cached', 'log --oneline -20', 'show abc1234', 'blame src/file.ts', 'diff main...HEAD'. Do not include the leading 'git'.",
     parameters: {
       type: "object",
       properties: {
@@ -38,13 +53,20 @@ export function createGitTool(workDir: string): Tool {
     },
     execute: async (args) => {
       const { command } = args as { command: string }
+
+      try {
+        assertNoShellChars(command)
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        return { output: `[ERROR] ${errMsg}` }
+      }
+
       const parts = parseCommand(command)
 
       const subcommand = parts[0] ?? ""
-      if (BLOCKED_SUBCOMMANDS.includes(subcommand)) {
+      if (!ALLOWED_SUBCOMMANDS.has(subcommand)) {
         return {
-          output: "",
-          error: `Blocked: 'git ${subcommand}' is not allowed in review mode`,
+          output: `[ERROR] Blocked: 'git ${subcommand}' is not allowed in review mode. Allowed read-only commands: ${[...ALLOWED_SUBCOMMANDS].join(", ")}`,
         }
       }
 
@@ -58,7 +80,7 @@ export function createGitTool(workDir: string): Tool {
         return { output: output.trimEnd() }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        return { output: "", error: msg }
+        return { output: `[ERROR] ${msg}` }
       }
     },
   }

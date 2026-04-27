@@ -1,15 +1,15 @@
 import type { Tool } from "simple-agent"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
-import { parseCommand } from "./parse-command.ts"
+import { parseCommand, assertNoShellChars } from "./parse-command.ts"
 
 const execFileAsync = promisify(execFile)
 
-const ALLOWED_TOP_LEVEL = ["pr", "issue", "api", "repo"]
+const ALLOWED_TOP_LEVEL = new Set(["pr", "issue", "api", "repo"])
 
-const ALLOWED_PR_SUB = ["view", "diff", "checks", "list", "status"]
+const ALLOWED_PR_SUB = new Set(["view", "diff", "checks", "list", "status"])
 
-const ALLOWED_ISSUE_SUB = ["view", "list", "status"]
+const ALLOWED_ISSUE_SUB = new Set(["view", "list", "status"])
 
 function hasWriteMethod(parts: string[]): boolean {
   for (let i = 0; i < parts.length; i++) {
@@ -26,7 +26,7 @@ export function createGhTool(workDir: string): Tool {
   return {
     name: "gh",
     description:
-      "Run a GitHub CLI (gh) subcommand. Examples: 'pr view 42', 'pr diff 42', 'pr diff 42 --name-only', 'pr checks 42', 'issue view 123', 'api repos/{owner}/{repo}/pulls/42/comments'. Do not include the leading 'gh'.",
+      "Run a read-only GitHub CLI (gh) subcommand. Examples: 'pr view 42', 'pr diff 42', 'issue view 123', 'api repos/{owner}/{repo}/pulls/42/comments'. Do not include the leading 'gh'.",
     parameters: {
       type: "object",
       properties: {
@@ -40,40 +40,44 @@ export function createGhTool(workDir: string): Tool {
     },
     execute: async (args) => {
       const { command } = args as { command: string }
+
+      try {
+        assertNoShellChars(command)
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        return { output: `[ERROR] ${errMsg}` }
+      }
+
       const parts = parseCommand(command)
 
       const topLevel = parts[0] ?? ""
-      if (!ALLOWED_TOP_LEVEL.includes(topLevel)) {
+      if (!ALLOWED_TOP_LEVEL.has(topLevel)) {
         return {
-          output: "",
-          error: `Blocked: 'gh ${topLevel}' is not allowed in review mode`,
+          output: `[ERROR] Blocked: 'gh ${topLevel}' is not allowed in review mode`,
         }
       }
 
       if (topLevel === "pr") {
         const prSub = parts[1] ?? ""
-        if (!ALLOWED_PR_SUB.includes(prSub)) {
+        if (!ALLOWED_PR_SUB.has(prSub)) {
           return {
-            output: "",
-            error: `Blocked: 'gh pr ${prSub}' is not allowed in review mode. Allowed: ${ALLOWED_PR_SUB.join(", ")}`,
+            output: `[ERROR] Blocked: 'gh pr ${prSub}' is not allowed in review mode. Allowed: ${[...ALLOWED_PR_SUB].join(", ")}`,
           }
         }
       }
 
       if (topLevel === "issue") {
         const issueSub = parts[1] ?? ""
-        if (!ALLOWED_ISSUE_SUB.includes(issueSub)) {
+        if (!ALLOWED_ISSUE_SUB.has(issueSub)) {
           return {
-            output: "",
-            error: `Blocked: 'gh issue ${issueSub}' is not allowed in review mode. Allowed: ${ALLOWED_ISSUE_SUB.join(", ")}`,
+            output: `[ERROR] Blocked: 'gh issue ${issueSub}' is not allowed in review mode. Allowed: ${[...ALLOWED_ISSUE_SUB].join(", ")}`,
           }
         }
       }
 
       if (topLevel === "api" && hasWriteMethod(parts)) {
         return {
-          output: "",
-          error: "Blocked: 'gh api' with non-GET method is not allowed in review mode",
+          output: "[ERROR] Blocked: 'gh api' with non-GET method is not allowed in review mode",
         }
       }
 
@@ -87,7 +91,7 @@ export function createGhTool(workDir: string): Tool {
         return { output: output.trimEnd() }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        return { output: "", error: msg }
+        return { output: `[ERROR] ${msg}` }
       }
     },
   }

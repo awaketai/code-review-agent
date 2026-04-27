@@ -7,5 +7,5 @@ export interface AppConfig {
 
 export const defaultConfig: AppConfig = {
   model: "claude-sonnet-4-6",
-  maxSteps: 50,
+  maxSteps: 20,
 }

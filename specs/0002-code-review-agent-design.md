@@ -14,7 +14,7 @@
 
 Agent 代码的职责**仅限于**：
 1. 加载 system prompt（从 `specs/0001-system.md`）
-2. 注册四个工具（`read_file`、`write_file`、`git`、`gh`）
+2. 注册五个工具（`read_file`、`write_file`、`git`、`gh`、`bash`）
 3. 将用户输入原样传给 LLM
 4. 执行 LLM 发出的工具调用，返回结果
 5. 流式输出 LLM 的响应文本
@@ -30,8 +30,8 @@ Agent 代码**不做**：
 ### 核心约束
 
 - 运行在 `simple-agent` 的 agent loop 中（`createSession` → `streamAgent`）
-- 仅有四个工具：`read_file`、`write_file`、`git`、`gh`
-- 不执行任意 shell 命令，不修改源代码，不运行测试/构建
+- 仅有五个工具：`read_file`、`write_file`、`git`、`gh`、`bash`
+- `bash` 工具仅允许白名单内的只读命令，不修改源代码，不运行测试/构建
 - System prompt 是唯一的行为定义来源（`specs/0001-system.md`）
 
 ---
@@ -64,14 +64,14 @@ Agent 代码**不做**：
 │  │         (specs/0001-system.md)               │ │
 │  └─────────────────────────────────────────────┘ │
 │                                                   │
-│  ┌──────────┐ ┌──────────┐ ┌─────┐ ┌──────────┐ │
-│  │read_file │ │write_file│ │ git │ │    gh    │ │
-│  └────┬─────┘ └────┬─────┘ └──┬──┘ └────┬─────┘ │
-│       │            │          │          │        │
-└───────┼────────────┼──────────┼──────────┼───────┘
-        │            │          │          │
-        ▼            ▼          ▼          ▼
-   文件系统        文件系统    git CLI    gh CLI
+│  ┌──────────┐ ┌──────────┐ ┌─────┐ ┌────┐ ┌──────┐ │
+│  │read_file │ │write_file│ │ git │ │ gh │ │ bash │ │
+│  └────┬─────┘ └────┬─────┘ └──┬──┘ └──┬─┘ └──┬───┘ │
+│       │            │          │        │       │      │
+└───────┼────────────┼──────────┼────────┼───────┼─────┘
+        │            │          │        │       │
+        ▼            ▼          ▼        ▼       ▼
+   文件系统        文件系统    git CLI  gh CLI  /bin/sh
 ```
 
 ### 3.1 系统分层
@@ -83,7 +83,8 @@ src/
 │   ├── read-file.ts      # read_file 工具实现
 │   ├── write-file.ts     # write_file 工具实现
 │   ├── git.ts            # git 工具实现
-│   └── gh.ts             # gh 工具实现
+│   ├── gh.ts             # gh 工具实现
+│   └── bash.ts           # bash 工具实现（白名单只读命令）
 ├── prompt/
 │   └── system.ts         # 加载并组装 system prompt
 └── config.ts             # 配置：模型、max steps 等
@@ -430,6 +431,67 @@ export function createGhTool(workDir: string): Tool {
 - `stdout !== "" ? stdout : stderr` 正确处理空 stdout（如无变更时），不会误用 stderr 替代
 - System prompt 中已告知 LLM 这些工具是只读的，LLM 不会主动尝试写操作；代码层的白名单是防御性兜底
 
+### 4.5 `bash`
+
+```typescript
+import type { Tool } from "simple-agent"
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
+
+const execFileAsync = promisify(execFile)
+
+const ALLOWED_COMMANDS = new Set([
+  "pwd", "ls", "find", "grep", "cat", "head", "tail", "wc",
+  "file", "stat", "which", "echo", "env", "uname", "date",
+  "dirname", "basename", "realpath", "du", "sort", "uniq",
+  "tr", "cut", "awk", "sed", "xargs", "tee", "diff", "tree",
+])
+
+export function createBashTool(workDir: string): Tool {
+  return {
+    name: "bash",
+    description: "Run a read-only shell command. Only whitelisted commands allowed.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The shell command to run" }
+      },
+      required: ["command"]
+    },
+    execute: async (args) => {
+      const { command } = args as { command: string }
+
+      // 提取管道中所有命令名，全部必须在白名单内
+      const commands = extractCommands(command)
+      const disallowed = commands.filter(c => !ALLOWED_COMMANDS.has(c))
+      if (disallowed.length > 0) {
+        return { output: "", error: `Blocked: ${disallowed.join(", ")}` }
+      }
+
+      // 拦截 sed -i（就地编辑）
+      if (hasSedInPlace(command)) {
+        return { output: "", error: "Blocked: 'sed -i' is not allowed" }
+      }
+
+      const { stdout, stderr } = await execFileAsync("/bin/sh", ["-c", command], {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 30_000,
+      })
+      return { output: (stdout || stderr).trimEnd() }
+    }
+  }
+}
+```
+
+**关键决策：**
+- 使用 `execFile("/bin/sh", ["-c", command])` 执行，因为白名单内的命令需要管道和重定向支持（如 `find . -name "*.ts" | wc -l`）
+- **白名单机制**：解析命令字符串，提取管道中所有命令名，全部必须在 `ALLOWED_COMMANDS` 白名单内
+- 路径前缀自动剥离：`/usr/bin/grep` → `grep`，确保完整路径的命令也能通过白名单
+- 特殊处理 `sed -i`：`sed` 本身允许（用于文本提取/打印），但 `-i` 标志（就地编辑）被拦截
+- 与 git/gh 工具一致的 `maxBuffer`（10MB）和 `timeout`（30s）配置
+- 不需要 `parseCommand` 工具，因为通过 shell 执行，shell 自行处理引号和转义
+
 ---
 
 ## 5. 入口设计
@@ -540,9 +602,10 @@ export async function loadSystemPrompt(): Promise<string> {
 | 风险 | System Prompt 防御（第一层） | 代码防御（第二层） |
 |------|---------------------------|-------------------|
 | 路径穿越 | 告知 LLM "路径穿越会被拒绝" | `resolve()` 前缀检查 + `realpath()` 解析符号链接后二次检查 |
-| Shell 注入 | 未覆盖（LLM 不了解底层实现） | 使用 `execFile` 而非 `exec`，不经过 shell 解释 |
+| Shell 注入 | 未覆盖（LLM 不了解底层实现） | `git`/`gh` 使用 `execFile` 不经过 shell；`bash` 工具经过 shell 但受白名单限制 |
 | Git 写操作 | 告知 LLM "git 是只读的，写操作会被拦截" | `git` 工具黑名单拦截 `push`、`commit`、`reset` 等 |
 | GitHub 写操作 | 告知 LLM "gh 是只读的，写操作会被拦截" | `gh` 工具白名单：`pr`/`issue` 子命令白名单 + `api` 拦截非 GET 方法 |
+| Bash 危险命令 | 告知 LLM "bash 只允许白名单命令，写操作会被拦截" | `bash` 工具白名单限制 30 个只读命令，拦截 `rm`/`mv`/`curl` 等，拦截 `sed -i` |
 | 大输出 OOM | 未覆盖 | `maxBuffer` 限制 10MB，`timeout` 30 秒 |
 | LLM 修改源代码 | 明确禁止："Never use `write_file` on source files" | 不做代码层限制（保留写报告的灵活性） |
 | LLM 无限循环 | 未覆盖 | `maxSteps` 限制（默认 50） |
@@ -679,7 +742,7 @@ export const defaultConfig: AppConfig = {
 | 阶段 | 任务 | 产出 |
 |------|------|------|
 | **P0** | 项目初始化：`package.json`、`tsconfig.json`、依赖 `simple-agent` | 可编译的空项目 |
-| **P0** | 实现四个工具：`read_file`、`write_file`、`git`、`gh` | `src/tools/*.ts` |
+| **P0** | 实现五个工具：`read_file`、`write_file`、`git`、`gh`、`bash` | `src/tools/*.ts` |
 | **P0** | 实现 system prompt 加载和入口 | `src/prompt/system.ts`、`src/index.ts` |
 | **P0** | CLI 入口：接受用户输入，启动 agent | 可运行的 CLI |
 | **P1** | 工具单元测试：路径穿越、命令拦截、正常执行 | `tests/tools/*.test.ts` |

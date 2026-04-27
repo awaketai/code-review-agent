@@ -1,14 +1,18 @@
 # code-review-agent
 
-LLM-driven code review agent built on [simple-agent](https://github.com/user/simple-agent). Give it a branch, commit, or PR — it reads the diff, gathers context, and produces a structured review.
+LLM-driven code review agent built on [simple-agent](https://github.com/user/simple-agent). Give it a branch, commit, or PR — it collects the diff, gathers context, and produces a structured review.
 
 ## How it works
 
 ```
-User input → simple-agent loop → LLM → tool calls → LLM → ... → review output
+User input
+  → LLM Target Parse (one cheap call, structured JSON)
+  → Deterministic context collection (git diff / gh pr diff / file reads)
+  → Agent loop (LLM reviews with pre-assembled context, optional supplementary queries)
+  → Review output to stdout
 ```
 
-The agent code contains **zero business logic**. All review behavior — what to check, how to gather context, output format — is defined in the [system prompt](specs/0001-system.md). The code just provides four tools and passes user input to the LLM.
+The agent splits responsibilities: **code handles orchestration** (target parsing, diff collection, context assembly, safety), while the **LLM handles judgment** (code understanding, risk assessment, review output).
 
 ## Install
 
@@ -41,6 +45,9 @@ pnpm dev "review commit abc1234 之后的代码"
 
 # Review a pull request
 pnpm dev "review pull request 42"
+
+# Review staged changes
+pnpm dev "review staged changes"
 ```
 
 Or use the built CLI:
@@ -56,16 +63,19 @@ node dist/index.js "review current branch"
 code-review-agent <review-target>
 ```
 
-The `<review-target>` is natural language. The LLM interprets it and decides which tools to call. Examples:
+The `<review-target>` is natural language. The LLM parses it into a structured target, then code collects the relevant diff and context. Examples:
 
-| Input | What happens |
-|-------|-------------|
-| `"review current branch"` | Diffs current branch against `main` (or `master`) |
-| `"review commit abc1234 之后的代码"` | Diffs from that commit to HEAD |
-| `"review pull request 42"` | Fetches PR context and diff via `gh` |
-| `"review src/index.ts"` | Diffs uncommitted changes in that file |
-| `"review staged changes"` | Diffs only staged (`--cached`) changes |
-| *(no arguments)* | Shows help |
+| Input | Target Type | What happens |
+|-------|-------------|-------------|
+| `"review"` / `"review uncommitted changes"` | `working-tree` | Diffs unstaged + staged changes |
+| `"review staged changes"` / `"review 暂存区"` | `staged` | Diffs only staged (`--cached`) changes |
+| `"review current branch"` | `current-branch` | Diffs branch against `main` (or uncommitted if on main) |
+| `"review abc1234"` | `commit` | Shows that commit's diff |
+| `"review abc1234 之后的代码"` / `"review since abc1234"` | `commit-range` | Diffs from that commit to HEAD |
+| `"review pull request 42"` / `"review PR 42"` | `pull-request` | Fetches PR diff via `gh` |
+| `"review src/index.ts"` | `file` | Diffs changes in that file |
+
+If the input is ambiguous or cannot be parsed, the agent reports an error and suggests clearer input.
 
 ## Environment variables
 
@@ -74,42 +84,47 @@ The `<review-target>` is natural language. The LLM interprets it and decides whi
 | `OPENAI_API_KEY` | yes | — | API key for the LLM provider |
 | `OPENAI_BASE_URL` | no | — | Custom base URL (for OpenAI-compatible providers) |
 | `REVIEW_MODEL` | no | `claude-sonnet-4-6` | Model name |
-| `REVIEW_MAX_STEPS` | no | `50` | Max agent loop iterations |
+| `REVIEW_MAX_STEPS` | no | `20` | Max agent loop iterations for supplementary queries |
 
 Works with any OpenAI-compatible API. Set `OPENAI_BASE_URL` to point at your provider.
 
-## Tools
+## Tools (agent loop)
 
-The agent has exactly four tools, all read-only with respect to the repository:
+The agent loop has three read-only tools for supplementary queries:
 
 | Tool | Purpose | Safety |
 |------|---------|--------|
-| `read_file` | Read file contents | Path traversal check + symlink resolution |
-| `write_file` | Write review output | Path traversal check; only for reports, not source |
-| `git` | Run git subcommands | Blocks write ops (`push`, `commit`, `reset`, etc.) |
-| `gh` | Run GitHub CLI subcommands | Whitelist: only `pr view/diff/checks/list/status`, `issue view/list/status`, `api` GET |
+| `read_file` | Read file contents | Path traversal check + symlink resolution; auto-truncates at 50KB |
+| `git` | Run read-only git subcommands | Blocks write ops, shell metacharacters (`\|`, `>`, `<`), unknown subcommands |
+| `gh` | Run read-only GitHub CLI | Whitelist: `pr view/diff/checks/list/status`, `issue view/list/status`, `api` GET only |
+
+No `write_file`, `bash`, or any write capability. All review output goes to stdout.
 
 ## Architecture
 
 ```
 src/
-├── index.ts              # CLI entry + runCodeReview()
+├── index.ts              # CLI entry: parse-target → build-context → agent loop
 ├── config.ts             # Default model, maxSteps
 ├── prompt/
 │   └── system.ts         # Loads specs/0001-system.md
+├── review/
+│   ├── types.ts          # ReviewTarget, ReviewContext type definitions
+│   ├── parse-target.ts   # LLM call: user input → ReviewTarget JSON
+│   └── build-context.ts  # Deterministic collection: target → diffs, files, conventions
 └── tools/
-    ├── parse-command.ts   # Shared command string parser
-    ├── read-file.ts       # read_file tool
-    ├── write-file.ts      # write_file tool
-    ├── git.ts             # git tool
-    └── gh.ts              # gh tool
+    ├── parse-command.ts  # Command string parser + shell char validation
+    ├── read-file.ts      # read_file tool (with 50KB truncation)
+    ├── git.ts            # git tool (read-only, strict validation)
+    └── gh.ts             # gh tool (read-only, whitelist)
 
 specs/
-├── 0001-system.md        # System prompt (all review behavior defined here)
-└── 0002-code-review-agent-design.md  # Design doc
+├── 0001-system.md        # System prompt (review judgment only)
+├── 0002-code-review-agent-design.md  # Original design doc
+└── 0003-review-orchestration-refactor.md  # Refactor spec
 ```
 
-Key principle: **intelligence lives in the system prompt, code is just plumbing.** To change review behavior (e.g. add SQL injection checks), edit `specs/0001-system.md` — no code changes needed.
+Key principle: **LLM handles understanding and judgment, code handles orchestration and safety.** The LLM parses natural language into structured targets, then reviews pre-assembled context. Code ensures deterministic data collection, tool boundaries, and error handling.
 
 ## Development
 
@@ -132,5 +147,6 @@ pnpm dev "review current branch"
 
 ## Design docs
 
-- [System Prompt](specs/0001-system.md) — defines all LLM behavior
-- [Design Doc](specs/0002-code-review-agent-design.md) — architecture, tool design, security model
+- [System Prompt](specs/0001-system.md) — review judgment instructions
+- [Original Design Doc](specs/0002-code-review-agent-design.md) — initial architecture
+- [Refactor Spec](specs/0003-review-orchestration-refactor.md) — orchestration refactor rationale and plan

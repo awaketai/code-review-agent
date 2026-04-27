@@ -1,91 +1,136 @@
 import "dotenv/config"
 import { createSession, streamAgent } from "simple-agent"
 import { createReadFileTool } from "./tools/read-file.ts"
-import { createWriteFileTool } from "./tools/write-file.ts"
 import { createGitTool } from "./tools/git.ts"
 import { createGhTool } from "./tools/gh.ts"
 import { loadSystemPrompt } from "./prompt/system.ts"
 import { defaultConfig } from "./config.ts"
+import { parseReviewTarget } from "./review/parse-target.ts"
+import { buildReviewContext, ReviewError } from "./review/build-context.ts"
 import type { AppConfig } from "./config.ts"
+import type { ReviewContext } from "./review/types.ts"
 import type { Tool } from "simple-agent"
-import { execFile } from "node:child_process"
-import { promisify } from "node:util"
-
-const execFileAsync = promisify(execFile)
-
-const MAX_SAME_CALL = 2
-
-function withLoopDetection(tool: Tool): Tool {
-  const callCounts = new Map<string, number>()
-
-  const originalExecute = tool.execute
-  return {
-    ...tool,
-    execute: async (args) => {
-      const key = `${tool.name}:${JSON.stringify(args)}`
-      const count = (callCounts.get(key) ?? 0) + 1
-      callCounts.set(key, count)
-
-      if (count > MAX_SAME_CALL) {
-        return {
-          output: "",
-          error: `Loop detected: you have called ${tool.name} with the same arguments ${count} times. Stop repeating and produce your review output now based on the information you already have.`,
-        }
-      }
-      return originalExecute(args)
-    },
-  }
-}
-
-async function runQuiet(workDir: string, args: string[]): Promise<string> {
-  try {
-    const { stdout } = await execFileAsync("git", args, {
-      cwd: workDir,
-      timeout: 10_000,
-    })
-    return stdout.trim()
-  } catch {
-    return ""
-  }
-}
-
-async function buildContext(workDir: string): Promise<string> {
-  const [branch, logShort, statusShort] = await Promise.all([
-    runQuiet(workDir, ["rev-parse", "--abbrev-ref", "HEAD"]),
-    runQuiet(workDir, ["log", "--oneline", "-5"]),
-    runQuiet(workDir, ["status", "--short"]),
-  ])
-
-  const lines: string[] = [
-    "[Repository context — you do NOT need to call git to discover this information]",
-    `Current branch: ${branch || "unknown"}`,
-  ]
-  if (logShort) {
-    lines.push(`Recent commits:\n${logShort}`)
-  }
-  if (statusShort) {
-    lines.push(`Uncommitted changes:\n${statusShort}`)
-  } else {
-    lines.push("Uncommitted changes: none")
-  }
-  return lines.join("\n")
-}
 
 interface ReviewConfig extends AppConfig {
   workDir: string
 }
 
+function withLoopDetection(tool: Tool, preloadedFiles?: Map<string, string>): Tool {
+  const resultCache = new Map<string, { output: string }>()
+  const originalExecute = tool.execute
+  return {
+    ...tool,
+    execute: async (args) => {
+      const key = `${tool.name}:${JSON.stringify(args)}`
+
+      // Return cached result for any duplicate call (any tool)
+      const cached = resultCache.get(key)
+      if (cached) return cached
+
+      // For read_file, intercept calls to pre-loaded files (skip disk I/O)
+      if (tool.name === "read_file" && preloadedFiles) {
+        const path = (args as { path: string }).path
+        const preloaded = preloadedFiles.get(path)
+        if (preloaded !== undefined) {
+          const result = { output: preloaded }
+          resultCache.set(key, result)
+          return result
+        }
+      }
+
+      const result = await originalExecute(args)
+      resultCache.set(key, result)
+      return result
+    },
+  }
+}
+
+function formatReviewContext(ctx: ReviewContext): string {
+  const sections: string[] = []
+
+  sections.push("[Review Target]")
+  sections.push(ctx.target.type)
+
+  if (Object.keys(ctx.summary).length > 0) {
+    sections.push("\n[Repository Summary]")
+    if (ctx.summary.branch) sections.push(`Current branch: ${ctx.summary.branch}`)
+    if (ctx.summary.baseBranch) sections.push(`Base branch: ${ctx.summary.baseBranch}`)
+    if (ctx.summary.recentCommits) sections.push(`Recent commits:\n${ctx.summary.recentCommits}`)
+    if (ctx.summary.statusShort) sections.push(`Uncommitted changes:\n${ctx.summary.statusShort}`)
+    if (ctx.summary.prMetadata) sections.push(`PR metadata:\n${ctx.summary.prMetadata}`)
+    if (ctx.summary.commitMetadata) sections.push(`Commit metadata:\n${ctx.summary.commitMetadata}`)
+  }
+
+  if (ctx.changedFiles.length > 0) {
+    sections.push("\n[Changed Files]")
+    for (const f of ctx.changedFiles) {
+      sections.push(`- ${f}`)
+    }
+  }
+
+  for (const diff of ctx.diffs) {
+    sections.push(`\n[Diff: ${diff.label}]`)
+    sections.push(diff.content)
+  }
+
+  if (ctx.files.length > 0) {
+    sections.push("\n[Pre-loaded Files — full content provided below, do NOT read_file these]")
+    for (const f of ctx.files) {
+      sections.push(`- ${f.path}`)
+    }
+  }
+
+  for (const file of ctx.files) {
+    sections.push(`\n[File: ${file.path}]`)
+    sections.push(file.content)
+  }
+
+  if (ctx.omittedFiles.length > 0) {
+    sections.push("\n[Omitted Files]")
+    for (const f of ctx.omittedFiles) {
+      const detail = f.detail ? ` (${f.detail})` : ""
+      sections.push(`- ${f.path}: ${f.reason}${detail}`)
+    }
+  }
+
+  for (const conv of ctx.conventions) {
+    sections.push(`\n[Conventions: ${conv.path}]`)
+    sections.push(conv.content)
+  }
+
+  return sections.join("\n")
+}
+
 export async function runCodeReview(input: string, config: ReviewConfig) {
   const workDir = config.workDir
   const systemPrompt = await loadSystemPrompt()
-  const context = await buildContext(workDir)
+
+  // Step 1: Parse user input to ReviewTarget
+  process.stderr.write("[parse] Parsing review target...\n")
+  const parseConfig: { model: string; apiKey?: string; baseURL?: string } = { model: config.model }
+  if (config.apiKey) parseConfig.apiKey = config.apiKey
+  if (config.baseURL) parseConfig.baseURL = config.baseURL
+  const target = await parseReviewTarget(input, parseConfig)
+  process.stderr.write(`[parse] Target: ${target.type}\n`)
+
+  // Step 2: Build ReviewContext deterministically
+  process.stderr.write("[collect] Gathering diff and context...\n")
+  const context = await buildReviewContext(target, workDir)
+  process.stderr.write(
+    `[collect] ${context.diffs.length} diff(s), ${context.changedFiles.length} changed files, ${context.files.length} file contents loaded\n`,
+  )
+
+  // Step 3: Agent loop — LLM reviews with pre-assembled context
+  const preloadedFiles = new Map<string, string>()
+  for (const f of context.files) {
+    preloadedFiles.set(f.path, f.content)
+  }
 
   const tools = [
     createReadFileTool(workDir),
-    createWriteFileTool(workDir),
     createGitTool(workDir),
     createGhTool(workDir),
-  ].map(withLoopDetection)
+  ].map((tool) => withLoopDetection(tool, preloadedFiles))
 
   const agentConfig = {
     model: config.model,
@@ -101,9 +146,7 @@ export async function runCodeReview(input: string, config: ReviewConfig) {
   session.messages.push({
     id: `user-${Date.now()}`,
     role: "user",
-    content: [
-      { type: "text", text: `${context}\n\n---\n\n${input}` },
-    ],
+    content: [{ type: "text", text: `[User Request]\n${input}\n\n${formatReviewContext(context)}` }],
     createdAt: new Date(),
   })
 
@@ -115,13 +158,13 @@ export async function runCodeReview(input: string, config: ReviewConfig) {
       case "tool_call":
         process.stderr.write(`\n[tool] ${event.name}(${JSON.stringify(event.args)})\n`)
         break
-      case "tool_result":
-        if (event.result.length > 200) {
-          process.stderr.write(`[result] ${event.name}: ${event.result.slice(0, 200)}...\n`)
-        } else {
-          process.stderr.write(`[result] ${event.name}: ${event.result}\n`)
-        }
+      case "tool_result": {
+        const result = event.result.length > 200
+          ? `${event.result.slice(0, 200)}...`
+          : event.result
+        process.stderr.write(`[result] ${event.name}: ${result}\n`)
         break
+      }
       case "error":
         console.error(`Error: ${event.error.message}`)
         break
@@ -145,12 +188,14 @@ Examples:
   code-review-agent "review commit abc1234 之后的代码"
   code-review-agent "review pull request 42"
   code-review-agent "review src/index.ts"
+  code-review-agent "review staged changes"
+  code-review-agent "review"
 
 Environment:
   OPENAI_API_KEY   Required. API key for the LLM provider.
   OPENAI_BASE_URL  Optional. Custom base URL for the LLM provider.
   REVIEW_MODEL     Optional. Model name (default: claude-sonnet-4-6).
-  REVIEW_MAX_STEPS Optional. Max agent steps (default: 50).`)
+  REVIEW_MAX_STEPS Optional. Max agent steps (default: 20).`)
     process.exit(0)
   }
 
@@ -166,8 +211,12 @@ Environment:
   try {
     await runCodeReview(input, config)
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error(`Fatal: ${msg}`)
+    if (err instanceof ReviewError) {
+      console.error(err.message)
+    } else {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error(`Fatal: ${msg}`)
+    }
     process.exit(1)
   }
 }

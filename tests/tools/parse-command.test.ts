@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { parseCommand } from "../../src/tools/parse-command.ts"
+import { parseCommand, assertNoShellChars } from "../../src/tools/parse-command.ts"
 
 describe("parseCommand", () => {
   it("splits simple command", () => {
@@ -30,19 +30,30 @@ describe("parseCommand", () => {
     expect(parseCommand("commit -m 'fix the bug'")).toEqual(["commit", "-m", "fix the bug"])
   })
 
-  it("strips shell redirect 2>&1", () => {
-    expect(parseCommand("log --oneline 2>&1")).toEqual(["log", "--oneline"])
+  it("preserves redirect tokens (shell validation is separate)", () => {
+    expect(parseCommand("diff > output.txt")).toEqual(["diff", ">", "output.txt"])
   })
 
-  it("strips shell redirect >", () => {
-    expect(parseCommand("diff > output.txt")).toEqual(["diff"])
+  it("preserves pipe token (shell validation is separate)", () => {
+    expect(parseCommand("log --oneline | head -5")).toEqual(["log", "--oneline", "|", "head", "-5"])
+  })
+})
+
+describe("assertNoShellChars", () => {
+  it("passes for valid commands", () => {
+    expect(() => assertNoShellChars("diff main...HEAD")).not.toThrow()
+    expect(() => assertNoShellChars("log --oneline -20")).not.toThrow()
   })
 
-  it("strips shell pipe |", () => {
-    expect(parseCommand("log --oneline | head -5")).toEqual(["log", "--oneline", "head", "-5"])
+  it("rejects pipe", () => {
+    expect(() => assertNoShellChars("log --oneline | head -5")).toThrow(/Shell metacharacters/)
   })
 
-  it("strips 2>> redirect", () => {
-    expect(parseCommand("log 2>> err.log")).toEqual(["log"])
+  it("rejects redirect >", () => {
+    expect(() => assertNoShellChars("diff > output.txt")).toThrow(/Shell metacharacters/)
+  })
+
+  it("rejects redirect <", () => {
+    expect(() => assertNoShellChars("diff < input.txt")).toThrow(/Shell metacharacters/)
   })
 })
